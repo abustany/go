@@ -118,8 +118,6 @@ func (q *qpReader) Read(p []byte) (n int, err error) {
 			q.line = q.line[2:] // 2 of the 3; other 1 is done below
 		case b == '\t' || b == '\r' || b == '\n':
 			break
-		case b < ' ' || b > '~':
-			return n, fmt.Errorf("multipart: invalid unescaped byte 0x%02x in quoted-printable body", b)
 		}
 		p[0] = b
 		p = p[1:]

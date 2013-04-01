@@ -1,3 +1,11 @@
+Note: this is NOT an official version of the Go programming language.
+it contains patches by me (notably to improve email handling) that
+have not been reviewed or approved by anyone. I don't guarantee either
+that I'll update this repository. In other words: it works for me, use
+it if you wish, but do so at your own risk :-)
+
+--
+
 This is the source code repository for the Go programming language.  
 
 For documentation about how to install and use Go,

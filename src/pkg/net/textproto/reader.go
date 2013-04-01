@@ -7,6 +7,7 @@ package textproto
 import (
 	"bufio"
 	"bytes"
+	"encoding/charset"
 	"io"
 	"io/ioutil"
 	"strconv"
@@ -481,7 +482,23 @@ func (r *Reader) ReadMIMEHeader() (MIMEHeader, error) {
 		for i < len(kv) && (kv[i] == ' ' || kv[i] == '\t') {
 			i++
 		}
-		value := string(kv[i:])
+
+		valueBytes := kv[i:]
+		valueEnc, err := charset.Detect(valueBytes)
+
+		if err != nil {
+			// This is a decent fallback value: it's backwards compatible with ASCII
+			valueEnc = "ISO-8859-1"
+		}
+
+		valueUtf, err := charset.Convert(valueBytes, valueEnc, "UTF-8")
+
+		if err != nil {
+			// At least we tried
+			valueUtf = valueBytes
+		}
+
+		value := string(valueUtf)
 
 		m[key] = append(m[key], value)
 

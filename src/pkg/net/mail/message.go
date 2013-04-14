@@ -26,6 +26,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/textproto"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -105,10 +106,24 @@ func parseDate(date string) (time.Time, error) {
 // A Header represents the key-value pairs in a mail message header.
 type Header map[string][]string
 
+var rfc2047TermRegex = regexp.MustCompile(`=\?[\w\-]+\?[bBqQ]\?[^?]+\?=`)
+
+func decodePartiallyRFC2047Encoded(s string) string {
+	return rfc2047TermRegex.ReplaceAllStringFunc(s, func(s string) string {
+		dec, err := decodeRFC2047Word(s)
+
+		if err != nil {
+			return s
+		}
+
+		return dec
+	})
+}
+
 // Get gets the first value associated with the given key.
 // If there are no values associated with the key, Get returns "".
 func (h Header) Get(key string) string {
-	return textproto.MIMEHeader(h).Get(key)
+	return decodePartiallyRFC2047Encoded(textproto.MIMEHeader(h).Get(key))
 }
 
 var ErrHeaderNotPresent = errors.New("mail: header not in message")

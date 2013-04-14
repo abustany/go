@@ -19,6 +19,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
+	"encoding/charset"
 	"errors"
 	"fmt"
 	"io"
@@ -440,11 +441,7 @@ func decodeRFC2047Word(s string) (string, error) {
 	if len(fields) != 5 || fields[0] != "=" || fields[4] != "=" {
 		return "", errors.New("mail: address not RFC 2047 encoded")
 	}
-	charset, enc := strings.ToLower(fields[1]), strings.ToLower(fields[2])
-	if charset != "iso-8859-1" && charset != "utf-8" {
-		return "", fmt.Errorf("mail: charset not supported: %q", charset)
-	}
-
+	codeset, enc := strings.ToLower(fields[1]), strings.ToLower(fields[2])
 	in := bytes.NewBufferString(fields[3])
 	var r io.Reader
 	switch enc {
@@ -461,17 +458,13 @@ func decodeRFC2047Word(s string) (string, error) {
 		return "", err
 	}
 
-	switch charset {
-	case "iso-8859-1":
-		b := new(bytes.Buffer)
-		for _, c := range dec {
-			b.WriteRune(rune(c))
-		}
-		return b.String(), nil
-	case "utf-8":
-		return string(dec), nil
+	dec, err = charset.Convert(dec, codeset, "utf-8")
+
+	if err != nil {
+		return "", fmt.Errorf("mail: charset not supported: %q", codeset)
 	}
-	panic("unreachable")
+
+	return string(dec), nil
 }
 
 type qDecoder struct {

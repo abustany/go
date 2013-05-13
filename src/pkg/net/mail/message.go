@@ -32,7 +32,7 @@ import (
 	"time"
 )
 
-var debug = debugT(false)
+var debug = debugT(true)
 
 type debugT bool
 
@@ -123,6 +123,13 @@ func decodePartiallyRFC2047Encoded(s string) string {
 // Get gets the first value associated with the given key.
 // If there are no values associated with the key, Get returns "".
 func (h Header) Get(key string) string {
+	return textproto.MIMEHeader(h).Get(key)
+}
+
+// Get gets the first value associated with the given key, decoding it if it
+// was encoded in RFC2047 encoding.
+// If there are no values associated with the key, Get returns "".
+func (h Header) GetDecoded(key string) string {
 	return decodePartiallyRFC2047Encoded(textproto.MIMEHeader(h).Get(key))
 }
 

@@ -192,14 +192,12 @@ type DB struct {
 	driver driver.Driver
 	dsn    string
 
-	mu        sync.Mutex           // protects following fields
-	outConn   map[*driverConn]bool // whether the conn is in use
-	freeConn  []*driverConn
-	closed    bool
-	dep       map[finalCloser]depSet
-	onConnPut map[*driverConn][]func() // code (with mu held) run when conn is next returned
-	lastPut   map[*driverConn]string   // stacktrace of last conn's put; debug only
-	maxIdle   int                      // zero means defaultMaxIdleConns; negative means 0
+	mu       sync.Mutex // protects following fields
+	freeConn []*driverConn
+	closed   bool
+	dep      map[finalCloser]depSet
+	lastPut  map[*driverConn]string // stacktrace of last conn's put; debug only
+	maxIdle  int                    // zero means defaultMaxIdleConns; negative means 0
 }
 
 // driverConn wraps a driver.Conn with a mutex, to
@@ -209,9 +207,46 @@ type DB struct {
 type driverConn struct {
 	db *DB
 
-	sync.Mutex // guards following
-	ci         driver.Conn
-	closed     bool
+	sync.Mutex  // guards following
+	ci          driver.Conn
+	closed      bool
+	finalClosed bool // ci.Close has been called
+	openStmt    map[driver.Stmt]bool
+
+	// guarded by db.mu
+	inUse      bool
+	onPut      []func() // code (with db.mu held) run when conn is next returned
+	dbmuClosed bool     // same as closed, but guarded by db.mu, for connIfFree
+}
+
+func (dc *driverConn) removeOpenStmt(si driver.Stmt) {
+	dc.Lock()
+	defer dc.Unlock()
+	delete(dc.openStmt, si)
+}
+
+func (dc *driverConn) prepareLocked(query string) (driver.Stmt, error) {
+	si, err := dc.ci.Prepare(query)
+	if err == nil {
+		// Track each driverConn's open statements, so we can close them
+		// before closing the conn.
+		//
+		// TODO(bradfitz): let drivers opt out of caring about
+		// stmt closes if the conn is about to close anyway? For now
+		// do the safe thing, in case stmts need to be closed.
+		//
+		// TODO(bradfitz): after Go 1.1, closing driver.Stmts
+		// should be moved to driverStmt, using unique
+		// *driverStmts everywhere (including from
+		// *Stmt.connStmt, instead of returning a
+		// driver.Stmt), using driverStmt as a pointer
+		// everywhere, and making it a finalCloser.
+		if dc.openStmt == nil {
+			dc.openStmt = make(map[driver.Stmt]bool)
+		}
+		dc.openStmt[si] = true
+	}
+	return si, err
 }
 
 // the dc.db's Mutex is held.
@@ -234,13 +269,27 @@ func (dc *driverConn) Close() error {
 	}
 	dc.closed = true
 	dc.Unlock() // not defer; removeDep finalClose calls may need to lock
-	return dc.db.removeDep(dc, dc)
+
+	// And now updates that require holding dc.mu.Lock.
+	dc.db.mu.Lock()
+	dc.dbmuClosed = true
+	fn := dc.db.removeDepLocked(dc, dc)
+	dc.db.mu.Unlock()
+	return fn()
 }
 
 func (dc *driverConn) finalClose() error {
 	dc.Lock()
+
+	for si := range dc.openStmt {
+		si.Close()
+	}
+	dc.openStmt = nil
+
 	err := dc.ci.Close()
 	dc.ci = nil
+	dc.finalClosed = true
+
 	dc.Unlock()
 	return err
 }
@@ -262,7 +311,8 @@ func (ds *driverStmt) Close() error {
 // depSet is a finalCloser's outstanding dependencies
 type depSet map[interface{}]bool // set of true bools
 
-// The finalCloser interface is used by (*DB).addDep and (*DB).get
+// The finalCloser interface is used by (*DB).addDep and related
+// dependency reference counting.
 type finalCloser interface {
 	// finalClose is called when the reference count of an object
 	// goes to zero. (*DB).mu is not held while calling it.
@@ -341,11 +391,9 @@ func Open(driverName, dataSourceName string) (*DB, error) {
 		return nil, fmt.Errorf("sql: unknown driver %q (forgotten import?)", driverName)
 	}
 	db := &DB{
-		driver:    driveri,
-		dsn:       dataSourceName,
-		outConn:   make(map[*driverConn]bool),
-		lastPut:   make(map[*driverConn]string),
-		onConnPut: make(map[*driverConn][]func()),
+		driver:  driveri,
+		dsn:     dataSourceName,
+		lastPut: make(map[*driverConn]string),
 	}
 	return db, nil
 }
@@ -427,7 +475,7 @@ func (db *DB) conn() (*driverConn, error) {
 	if n := len(db.freeConn); n > 0 {
 		conn := db.freeConn[n-1]
 		db.freeConn = db.freeConn[:n-1]
-		db.outConn[conn] = true
+		conn.inUse = true
 		db.mu.Unlock()
 		return conn, nil
 	}
@@ -443,21 +491,31 @@ func (db *DB) conn() (*driverConn, error) {
 	}
 	db.mu.Lock()
 	db.addDepLocked(dc, dc)
-	db.outConn[dc] = true
+	dc.inUse = true
 	db.mu.Unlock()
 	return dc, nil
 }
 
-// connIfFree returns (wanted, true) if wanted is still a valid conn and
+var (
+	errConnClosed = errors.New("database/sql: internal sentinel error: conn is closed")
+	errConnBusy   = errors.New("database/sql: internal sentinel error: conn is busy")
+)
+
+// connIfFree returns (wanted, nil) if wanted is still a valid conn and
 // isn't in use.
 //
-// If wanted is valid but in use, connIfFree returns (wanted, false).
-// If wanted is invalid, connIfFre returns (nil, false).
-func (db *DB) connIfFree(wanted *driverConn) (conn *driverConn, ok bool) {
+// The error is errConnClosed if the connection if the requested connection
+// is invalid because it's been closed.
+//
+// The error is errConnBusy if the connection is in use.
+func (db *DB) connIfFree(wanted *driverConn) (*driverConn, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if db.outConn[wanted] {
-		return conn, false
+	if wanted.inUse {
+		return nil, errConnBusy
+	}
+	if wanted.dbmuClosed {
+		return nil, errConnClosed
 	}
 	for i, conn := range db.freeConn {
 		if conn != wanted {
@@ -465,10 +523,15 @@ func (db *DB) connIfFree(wanted *driverConn) (conn *driverConn, ok bool) {
 		}
 		db.freeConn[i] = db.freeConn[len(db.freeConn)-1]
 		db.freeConn = db.freeConn[:len(db.freeConn)-1]
-		db.outConn[wanted] = true
-		return wanted, true
+		wanted.inUse = true
+		return wanted, nil
 	}
-	return nil, false
+	// TODO(bradfitz): shouldn't get here. After Go 1.1, change this to:
+	// panic("connIfFree call requested a non-closed, non-busy, non-free conn")
+	// Which passes all the tests, but I'm too paranoid to include this
+	// late in Go 1.1.
+	// Instead, treat it like a busy connection:
+	return nil, errConnBusy
 }
 
 // putConnHook is a hook for testing.
@@ -480,12 +543,16 @@ var putConnHook func(*DB, *driverConn)
 func (db *DB) noteUnusedDriverStatement(c *driverConn, si driver.Stmt) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if db.outConn[c] {
-		db.onConnPut[c] = append(db.onConnPut[c], func() {
+	if c.inUse {
+		c.onPut = append(c.onPut, func() {
 			si.Close()
 		})
 	} else {
-		si.Close()
+		c.Lock()
+		defer c.Unlock()
+		if !c.finalClosed {
+			si.Close()
+		}
 	}
 }
 
@@ -497,7 +564,7 @@ const debugGetPut = false
 // err is optionally the last error that occurred on this connection.
 func (db *DB) putConn(dc *driverConn, err error) {
 	db.mu.Lock()
-	if !db.outConn[dc] {
+	if !dc.inUse {
 		if debugGetPut {
 			fmt.Printf("putConn(%v) DUPLICATE was: %s\n\nPREVIOUS was: %s", dc, stack(), db.lastPut[dc])
 		}
@@ -506,14 +573,12 @@ func (db *DB) putConn(dc *driverConn, err error) {
 	if debugGetPut {
 		db.lastPut[dc] = stack()
 	}
-	delete(db.outConn, dc)
+	dc.inUse = false
 
-	if fns, ok := db.onConnPut[dc]; ok {
-		for _, fn := range fns {
-			fn()
-		}
-		delete(db.onConnPut, dc)
+	for _, fn := range dc.onPut {
+		fn()
 	}
+	dc.onPut = nil
 
 	if err == driver.ErrBadConn {
 		// Don't reuse bad connections.
@@ -528,8 +593,6 @@ func (db *DB) putConn(dc *driverConn, err error) {
 		db.mu.Unlock()
 		return
 	}
-	// TODO: check to see if we need this Conn for any prepared
-	// statements which are still active?
 	db.mu.Unlock()
 
 	dc.Close()
@@ -562,7 +625,7 @@ func (db *DB) prepare(query string) (*Stmt, error) {
 		return nil, err
 	}
 	dc.Lock()
-	si, err := dc.ci.Prepare(query)
+	si, err := dc.prepareLocked(query)
 	dc.Unlock()
 	if err != nil {
 		db.putConn(dc, err)
@@ -574,7 +637,6 @@ func (db *DB) prepare(query string) (*Stmt, error) {
 		css:   []connStmt{{dc, si}},
 	}
 	db.addDep(stmt, stmt)
-	db.addDep(dc, stmt)
 	db.putConn(dc, nil)
 	return stmt, nil
 }
@@ -625,7 +687,6 @@ func (db *DB) exec(query string, args []interface{}) (res Result, err error) {
 		return nil, err
 	}
 	defer withLock(dc, func() { si.Close() })
-
 	return resultFromStatement(driverStmt{dc, si}, args...)
 }
 
@@ -674,7 +735,6 @@ func (db *DB) queryConn(dc *driverConn, releaseConn func(error), query string, a
 			// Note: ownership of dc passes to the *Rows, to be freed
 			// with releaseConn.
 			rows := &Rows{
-				db:          db,
 				dc:          dc,
 				releaseConn: releaseConn,
 				rowsi:       rowsi,
@@ -704,7 +764,6 @@ func (db *DB) queryConn(dc *driverConn, releaseConn func(error), query string, a
 	// Note: ownership of ci passes to the *Rows, to be freed
 	// with releaseConn.
 	rows := &Rows{
-		db:          db,
 		dc:          dc,
 		releaseConn: releaseConn,
 		rowsi:       rowsi,
@@ -1051,13 +1110,21 @@ func (s *Stmt) connStmt() (ci *driverConn, releaseConn func(error), si driver.St
 
 	var cs connStmt
 	match := false
-	for _, v := range s.css {
-		// TODO(bradfitz): lazily clean up entries in this
-		// list with dead conns while enumerating
-		if _, match = s.db.connIfFree(v.dc); match {
+	for i := 0; i < len(s.css); i++ {
+		v := s.css[i]
+		_, err := s.db.connIfFree(v.dc)
+		if err == nil {
+			match = true
 			cs = v
 			break
 		}
+		if err == errConnClosed {
+			// Lazily remove dead conn from our freelist.
+			s.css[i] = s.css[len(s.css)-1]
+			s.css = s.css[:len(s.css)-1]
+			i--
+		}
+
 	}
 	s.mu.Unlock()
 
@@ -1070,7 +1137,7 @@ func (s *Stmt) connStmt() (ci *driverConn, releaseConn func(error), si driver.St
 				return nil, nil, nil, err
 			}
 			dc.Lock()
-			si, err := dc.ci.Prepare(s.query)
+			si, err := dc.prepareLocked(s.query)
 			dc.Unlock()
 			if err == driver.ErrBadConn && i < 10 {
 				continue
@@ -1078,7 +1145,6 @@ func (s *Stmt) connStmt() (ci *driverConn, releaseConn func(error), si driver.St
 			if err != nil {
 				return nil, nil, nil, err
 			}
-			s.db.addDep(dc, s)
 			s.mu.Lock()
 			cs = connStmt{dc, si}
 			s.css = append(s.css, cs)
@@ -1113,7 +1179,6 @@ func (s *Stmt) Query(args ...interface{}) (*Rows, error) {
 	// Note: ownership of ci passes to the *Rows, to be freed
 	// with releaseConn.
 	rows := &Rows{
-		db:    s.db,
 		dc:    dc,
 		rowsi: rowsi,
 		// releaseConn set below
@@ -1197,6 +1262,7 @@ func (s *Stmt) Close() error {
 func (s *Stmt) finalClose() error {
 	for _, v := range s.css {
 		s.db.noteUnusedDriverStatement(v.dc, v.si)
+		v.dc.removeOpenStmt(v.si)
 		s.db.removeDep(v.dc, s)
 	}
 	s.css = nil
@@ -1217,7 +1283,6 @@ func (s *Stmt) finalClose() error {
 //     err = rows.Err() // get any error encountered during iteration
 //     ...
 type Rows struct {
-	db          *DB
 	dc          *driverConn // owned; must call releaseConn when closed to release
 	releaseConn func(error)
 	rowsi       driver.Rows
@@ -1313,10 +1378,10 @@ func (rs *Rows) Close() error {
 	}
 	rs.closed = true
 	err := rs.rowsi.Close()
-	rs.releaseConn(err)
 	if rs.closeStmt != nil {
 		rs.closeStmt.Close()
 	}
+	rs.releaseConn(err)
 	return err
 }
 
@@ -1391,7 +1456,7 @@ func (dr driverResult) RowsAffected() (int64, error) {
 }
 
 func stack() string {
-	var buf [1024]byte
+	var buf [2 << 10]byte
 	return string(buf[:runtime.Stack(buf[:], false)])
 }
 

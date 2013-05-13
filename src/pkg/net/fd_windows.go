@@ -54,18 +54,17 @@ func canUseConnectEx(net string) bool {
 	return syscall.LoadConnectEx() == nil
 }
 
-func dialTimeout(net, addr string, timeout time.Duration) (Conn, error) {
+func resolveAndDial(net, addr string, localAddr Addr, deadline time.Time) (Conn, error) {
 	if !canUseConnectEx(net) {
 		// Use the relatively inefficient goroutine-racing
 		// implementation of DialTimeout.
-		return dialTimeoutRace(net, addr, timeout)
+		return resolveAndDialChannel(net, addr, localAddr, deadline)
 	}
-	deadline := time.Now().Add(timeout)
 	ra, err := resolveAddr("dial", net, addr, deadline)
 	if err != nil {
 		return nil, err
 	}
-	return dial(net, addr, noLocalAddr, ra, deadline)
+	return dial(net, addr, localAddr, ra, deadline)
 }
 
 // Interface for all IO operations.
@@ -365,22 +364,23 @@ func (o *connectOp) Name() string {
 	return "ConnectEx"
 }
 
-func (fd *netFD) connect(ra syscall.Sockaddr) error {
+func (fd *netFD) connect(la, ra syscall.Sockaddr) error {
 	if !canUseConnectEx(fd.net) {
 		return syscall.Connect(fd.sysfd, ra)
 	}
 	// ConnectEx windows API requires an unconnected, previously bound socket.
-	var la syscall.Sockaddr
-	switch ra.(type) {
-	case *syscall.SockaddrInet4:
-		la = &syscall.SockaddrInet4{}
-	case *syscall.SockaddrInet6:
-		la = &syscall.SockaddrInet6{}
-	default:
-		panic("unexpected type in connect")
-	}
-	if err := syscall.Bind(fd.sysfd, la); err != nil {
-		return err
+	if la == nil {
+		switch ra.(type) {
+		case *syscall.SockaddrInet4:
+			la = &syscall.SockaddrInet4{}
+		case *syscall.SockaddrInet6:
+			la = &syscall.SockaddrInet6{}
+		default:
+			panic("unexpected type in connect")
+		}
+		if err := syscall.Bind(fd.sysfd, la); err != nil {
+			return err
+		}
 	}
 	// Call ConnectEx API.
 	var o connectOp

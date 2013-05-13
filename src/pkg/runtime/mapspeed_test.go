@@ -118,6 +118,17 @@ func BenchmarkMegOneMap(b *testing.B) {
 	}
 }
 
+func BenchmarkMegEqMap(b *testing.B) {
+	m := make(map[string]bool)
+	key1 := strings.Repeat("X", 1<<20)
+	key2 := strings.Repeat("X", 1<<20) // equal but different instance
+	m[key1] = true
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = m[key2]
+	}
+}
+
 func BenchmarkMegEmptyMap(b *testing.B) {
 	m := make(map[string]bool)
 	key := strings.Repeat("X", 1<<20)
@@ -136,6 +147,23 @@ func BenchmarkSmallStrMap(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = m[key]
+	}
+}
+
+func BenchmarkMapStringKeysEight_16(b *testing.B) { benchmarkMapStringKeysEight(b, 16) }
+func BenchmarkMapStringKeysEight_32(b *testing.B) { benchmarkMapStringKeysEight(b, 32) }
+func BenchmarkMapStringKeysEight_64(b *testing.B) { benchmarkMapStringKeysEight(b, 64) }
+func BenchmarkMapStringKeysEight_1M(b *testing.B) { benchmarkMapStringKeysEight(b, 1<<20) }
+
+func benchmarkMapStringKeysEight(b *testing.B, keySize int) {
+	m := make(map[string]bool)
+	for i := 0; i < 8; i++ {
+		m[strings.Repeat("K", i+1)] = true
+	}
+	key := strings.Repeat("K", keySize)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = m[key]
 	}
 }
 
@@ -171,3 +199,10 @@ func benchmarkRepeatedLookup(b *testing.B, lookupKeySize int) {
 
 func BenchmarkRepeatedLookupStrMapKey32(b *testing.B) { benchmarkRepeatedLookup(b, 32) }
 func BenchmarkRepeatedLookupStrMapKey1M(b *testing.B) { benchmarkRepeatedLookup(b, 1<<20) }
+
+func BenchmarkNewEmptyMap(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = make(map[int]int)
+	}
+}

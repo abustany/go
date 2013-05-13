@@ -7,9 +7,10 @@ package runtime_test
 import (
 	"fmt"
 	"math"
-	"os"
+	"reflect"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -29,7 +30,7 @@ func TestNegativeZero(t *testing.T) {
 		t.Error("length wrong")
 	}
 
-	for k, _ := range m {
+	for k := range m {
 		if math.Copysign(1.0, k) > 0 {
 			t.Error("wrong sign")
 		}
@@ -43,7 +44,7 @@ func TestNegativeZero(t *testing.T) {
 		t.Error("length wrong")
 	}
 
-	for k, _ := range m {
+	for k := range m {
 		if math.Copysign(1.0, k) < 0 {
 			t.Error("wrong sign")
 		}
@@ -233,11 +234,8 @@ func TestIterGrowWithGC(t *testing.T) {
 	}
 }
 
-func TestConcurrentReadsAfterGrowth(t *testing.T) {
-	// TODO(khr): fix and enable this test.
-	t.Skip("Known currently broken; golang.org/issue/5179")
-
-	if os.Getenv("GOMAXPROCS") == "" {
+func testConcurrentReadsAfterGrowth(t *testing.T, useReflect bool) {
+	if runtime.GOMAXPROCS(-1) == 1 {
 		defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(16))
 	}
 	numLoop := 10
@@ -264,10 +262,29 @@ func TestConcurrentReadsAfterGrowth(t *testing.T) {
 						_ = m[key]
 					}
 				}()
+				if useReflect {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						mv := reflect.ValueOf(m)
+						keys := mv.MapKeys()
+						for _, k := range keys {
+							mv.MapIndex(k)
+						}
+					}()
+				}
 			}
 			wg.Wait()
 		}
 	}
+}
+
+func TestConcurrentReadsAfterGrowth(t *testing.T) {
+	testConcurrentReadsAfterGrowth(t, false)
+}
+
+func TestConcurrentReadsAfterGrowthReflect(t *testing.T) {
+	testConcurrentReadsAfterGrowth(t, true)
 }
 
 func TestBigItems(t *testing.T) {
@@ -320,9 +337,37 @@ func TestEmptyKeyAndValue(t *testing.T) {
 	}
 }
 
-func BenchmarkNewEmptyMap(b *testing.B) {
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_ = make(map[int]int)
+// Tests a map with a single bucket, with same-lengthed short keys
+// ("quick keys") as well as long keys.
+func TestSingleBucketMapStringKeys_DupLen(t *testing.T) {
+	testMapLookups(t, map[string]string{
+		"x":    "x1val",
+		"xx":   "x2val",
+		"foo":  "fooval",
+		"bar":  "barval", // same key length as "foo"
+		"xxxx": "x4val",
+		strings.Repeat("x", 128): "longval1",
+		strings.Repeat("y", 128): "longval2",
+	})
+}
+
+// Tests a map with a single bucket, with all keys having different lengths.
+func TestSingleBucketMapStringKeys_NoDupLen(t *testing.T) {
+	testMapLookups(t, map[string]string{
+		"x":                      "x1val",
+		"xx":                     "x2val",
+		"foo":                    "fooval",
+		"xxxx":                   "x4val",
+		"xxxxx":                  "x5val",
+		"xxxxxx":                 "x6val",
+		strings.Repeat("x", 128): "longval",
+	})
+}
+
+func testMapLookups(t *testing.T, m map[string]string) {
+	for k, v := range m {
+		if m[k] != v {
+			t.Fatalf("m[%q] = %q; want %q", k, m[k], v)
+		}
 	}
 }

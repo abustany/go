@@ -548,6 +548,12 @@ algtype1(Type *t, Type **bad)
 		*bad = T;
 
 	switch(t->etype) {
+	case TANY:
+	case TFORW:
+		// will be defined later.
+		*bad = t;
+		return -1;
+
 	case TINT8:
 	case TUINT8:
 	case TINT16:
@@ -665,11 +671,14 @@ Type*
 maptype(Type *key, Type *val)
 {
 	Type *t;
+	Type *bad;
+	int atype;
 
 	if(key != nil) {
-		switch(key->etype) {
+		atype = algtype1(key, &bad);
+		switch(bad == T ? key->etype : bad->etype) {
 		default:
-			if(algtype1(key, nil) == ANOEQ)
+			if(atype == ANOEQ)
 				yyerror("invalid map key type %T", key);
 			break;
 		case TANY:
@@ -830,7 +839,7 @@ Type*
 aindex(Node *b, Type *t)
 {
 	Type *r;
-	int bound;
+	int64 bound;
 
 	bound = -1;	// open bound
 	typecheck(&b, Erv);
@@ -1785,6 +1794,8 @@ ullmancalc(Node *n)
 		ul = ur;
 
 out:
+	if(ul > 200)
+		ul = 200; // clamp to uchar with room to grow
 	n->ullman = ul;
 }
 
@@ -2109,7 +2120,7 @@ localexpr(Node *n, Type *t, NodeList **init)
 void
 setmaxarg(Type *t)
 {
-	int32 w;
+	int64 w;
 
 	dowidth(t);
 	w = t->argwid;
@@ -3287,11 +3298,14 @@ liststmt(NodeList *l)
 int
 count(NodeList *l)
 {
-	int n;
+	vlong n;
 
 	n = 0;
 	for(; l; l=l->next)
 		n++;
+	if((int)n != n) { // Overflow.
+		yyerror("too many elements in list");
+	}
 	return n;
 }
 

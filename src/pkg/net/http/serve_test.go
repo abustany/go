@@ -1370,6 +1370,7 @@ func TestContentLengthZero(t *testing.T) {
 }
 
 func TestCloseNotifier(t *testing.T) {
+	defer afterTest(t)
 	gotReq := make(chan bool, 1)
 	sawClose := make(chan bool, 1)
 	ts := httptest.NewServer(HandlerFunc(func(rw ResponseWriter, req *Request) {
@@ -1403,6 +1404,31 @@ For:
 		}
 	}
 	ts.Close()
+}
+
+func TestCloseNotifierChanLeak(t *testing.T) {
+	defer afterTest(t)
+	req := []byte(strings.Replace(`GET / HTTP/1.0
+Host: golang.org
+
+`, "\n", "\r\n", -1))
+	for i := 0; i < 20; i++ {
+		var output bytes.Buffer
+		conn := &rwTestConn{
+			Reader: bytes.NewReader(req),
+			Writer: &output,
+			closec: make(chan bool, 1),
+		}
+		ln := &oneConnListener{conn: conn}
+		handler := HandlerFunc(func(rw ResponseWriter, r *Request) {
+			// Ignore the return value and never read from
+			// it, testing that we don't leak goroutines
+			// on the sending side:
+			_ = rw.(CloseNotifier).CloseNotify()
+		})
+		go Serve(ln, handler)
+		<-conn.closec
+	}
 }
 
 func TestOptions(t *testing.T) {
@@ -1929,6 +1955,67 @@ Host: golang.org
 	handler := HandlerFunc(func(rw ResponseWriter, r *Request) {
 		handled++
 		rw.Write(res)
+	})
+	ln := &oneConnListener{conn: conn}
+	go Serve(ln, handler)
+	<-conn.closec
+	if b.N != handled {
+		b.Errorf("b.N=%d but handled %d", b.N, handled)
+	}
+}
+
+const someResponse = "<html>some response</html>"
+
+// A Response that's just no bigger than 2KB, the buffer-before-chunking threshold.
+var response = bytes.Repeat([]byte(someResponse), 2<<10/len(someResponse))
+
+// Both Content-Type and Content-Length set. Should be no buffering.
+func BenchmarkServerHandlerTypeLen(b *testing.B) {
+	benchmarkHandler(b, HandlerFunc(func(w ResponseWriter, r *Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Length", strconv.Itoa(len(response)))
+		w.Write(response)
+	}))
+}
+
+// A Content-Type is set, but no length. No sniffing, but will count the Content-Length.
+func BenchmarkServerHandlerNoLen(b *testing.B) {
+	benchmarkHandler(b, HandlerFunc(func(w ResponseWriter, r *Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write(response)
+	}))
+}
+
+// A Content-Length is set, but the Content-Type will be sniffed.
+func BenchmarkServerHandlerNoType(b *testing.B) {
+	benchmarkHandler(b, HandlerFunc(func(w ResponseWriter, r *Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(response)))
+		w.Write(response)
+	}))
+}
+
+// Neither a Content-Type or Content-Length, so sniffed and counted.
+func BenchmarkServerHandlerNoHeader(b *testing.B) {
+	benchmarkHandler(b, HandlerFunc(func(w ResponseWriter, r *Request) {
+		w.Write(response)
+	}))
+}
+
+func benchmarkHandler(b *testing.B, h Handler) {
+	b.ReportAllocs()
+	req := []byte(strings.Replace(`GET / HTTP/1.1
+Host: golang.org
+
+`, "\n", "\r\n", -1))
+	conn := &rwTestConn{
+		Reader: &repeatReader{content: req, count: b.N},
+		Writer: ioutil.Discard,
+		closec: make(chan bool, 1),
+	}
+	handled := 0
+	handler := HandlerFunc(func(rw ResponseWriter, r *Request) {
+		handled++
+		h.ServeHTTP(rw, r)
 	})
 	ln := &oneConnListener{conn: conn}
 	go Serve(ln, handler)

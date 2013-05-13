@@ -417,7 +417,7 @@ havem:
 	RET
 
 // void setmg(M*, G*); set m and g. for use by needm.
-TEXT runtime·setmg(SB), 7, $-4
+TEXT runtime·setmg(SB), 7, $0
 	MOVW	mm+0(FP), m
 	MOVW	gg+4(FP), g
 
@@ -487,7 +487,7 @@ TEXT runtime·stackguard(SB),7,$0
 	MOVW	R2, limit+4(FP)
 	RET
 
-// not implemented for ARM
+// AES hashing not implemented for ARM
 TEXT runtime·aeshash(SB),7,$-4
 	MOVW	$0, R0
 	MOVW	(R0), R1
@@ -500,3 +500,20 @@ TEXT runtime·aeshash64(SB),7,$-4
 TEXT runtime·aeshashstr(SB),7,$-4
 	MOVW	$0, R0
 	MOVW	(R0), R1
+
+TEXT runtime·memeq(SB),7,$-4
+	MOVW	a+0(FP), R1
+	MOVW	b+4(FP), R2
+	MOVW	n+8(FP), R3
+	ADD	R1, R3, R6
+	MOVW	$1, R0
+_next:
+	CMP	R1, R6
+	RET.EQ
+	MOVBU.P	1(R1), R4
+	MOVBU.P	1(R2), R5
+	CMP	R4, R5
+	BEQ	_next
+
+	MOVW	$0, R0
+	RET
